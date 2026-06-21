@@ -212,6 +212,13 @@ class DOTADataset15(CustomDataset):
 
         return eval_results
 
+
+@ROTATED_DATASETS.register_module()
+class DOTAv15Dataset(DOTADataset15):
+    """Backward-compatible registry alias for DOTA v1.5 configs."""
+
+    pass
+
     def merge_det(self, results, nproc=4):
         """Merging patch bboxes into full image.
 

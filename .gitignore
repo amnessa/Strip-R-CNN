@@ -1,2 +1,7 @@
 mmrotate
 mmrotate.egg-info
+weights
+data
+pretrained
+
+*.pyc
