@@ -95,6 +95,11 @@ print(f'MMRotate version: {mmrotate.__version__}')
 
 # Device picker block reused verbatim in every config cell.
 DEVICE_BLOCK = """
+# --- Device selection: GPU-first ---------------------------------------------
+# Set FORCE_DEVICE to override auto-detection, e.g. 'cuda:0' to insist on the
+# GPU, or 'cpu' to insist on CPU. Leave None to auto-detect.
+FORCE_DEVICE = None
+
 CUDA_DEVICE_NAME = None
 CUDA_CAPABILITY = None
 SUPPORTED_CUDA_ARCHES = []
@@ -105,23 +110,31 @@ if torch.cuda.is_available():
 
 
 def pick_device() -> str:
-    \"\"\"Return 'cuda:0' only if this torch build can actually run on the GPU.
+    \"\"\"Prefer the GPU; only fall back to CPU when this torch build cannot run on it.
 
-    The RTX 50-series (Blackwell, sm_120) is reported as available by
-    torch.cuda.is_available(), but torch 1.8 was built only up to sm_75, so any
-    real kernel launch fails. We detect that mismatch and fall back to CPU.\"\"\"
+    Background: the RTX 50-series (Blackwell, sm_120) needs a PyTorch built with
+    CUDA 12.8 / sm_120 support (torch 2.7+). The 'openmmlab' env here has torch
+    1.8 (max sm_75): torch.cuda.is_available() is True but every kernel launch
+    fails, so we fall back to CPU. Once you run this notebook in an env whose
+    torch advertises sm_120 (see the GPU setup notes), this function returns
+    'cuda:0' automatically and the whole pipeline runs on the GPU.\"\"\"
+    if FORCE_DEVICE is not None:
+        return FORCE_DEVICE
     if not torch.cuda.is_available():
+        print('No CUDA device visible to torch -> using CPU.')
         return 'cpu'
 
     current_arch = f'sm_{CUDA_CAPABILITY[0]}{CUDA_CAPABILITY[1]}'
     if current_arch not in SUPPORTED_CUDA_ARCHES:
         print(
             f'CUDA device {CUDA_DEVICE_NAME} is visible, but this torch build does not support {current_arch}. '
-            f'Supported arches: {SUPPORTED_CUDA_ARCHES}. Falling back to CPU. '
-            f'Rebuild PyTorch with sm_120 support to use this GPU.'
+            f'Supported arches: {SUPPORTED_CUDA_ARCHES}. Falling back to CPU.\\n'
+            f'To use the GPU, run this notebook in an env whose PyTorch supports {current_arch} '
+            f'(CUDA 12.8 / torch 2.7+) together with a matching mmcv build.'
         )
         return 'cpu'
 
+    print(f'Using GPU: {CUDA_DEVICE_NAME} ({current_arch}).')
     return 'cuda:0'
 
 
@@ -746,10 +759,59 @@ def patch_dota() -> None:
     def join(cell):
         return ''.join(cell['source'])
 
+    old_pick = (
+        "def pick_device() -> str:\n"
+        "    if not torch.cuda.is_available():\n"
+        "        return 'cpu'\n"
+        "\n"
+        "    current_arch = f'sm_{CUDA_CAPABILITY[0]}{CUDA_CAPABILITY[1]}'\n"
+        "    if current_arch not in SUPPORTED_CUDA_ARCHES:\n"
+        "        print(\n"
+        "            f'CUDA device {CUDA_DEVICE_NAME} is visible, but this torch build does not support {current_arch}. '\n"
+        "            f'Supported arches: {SUPPORTED_CUDA_ARCHES}. Falling back to CPU. Upgrade PyTorch/CUDA to use this GPU.'\n"
+        "        )\n"
+        "        return 'cpu'\n"
+        "\n"
+        "    return 'cuda:0'"
+    )
+    new_pick = (
+        "def pick_device() -> str:\n"
+        "    \"\"\"Prefer the GPU; fall back to CPU only when this torch build cannot run on it.\n"
+        "    Set FORCE_DEVICE above to override (e.g. 'cuda:0' or 'cpu').\"\"\"\n"
+        "    if FORCE_DEVICE is not None:\n"
+        "        return FORCE_DEVICE\n"
+        "    if not torch.cuda.is_available():\n"
+        "        print('No CUDA device visible to torch -> using CPU.')\n"
+        "        return 'cpu'\n"
+        "\n"
+        "    current_arch = f'sm_{CUDA_CAPABILITY[0]}{CUDA_CAPABILITY[1]}'\n"
+        "    if current_arch not in SUPPORTED_CUDA_ARCHES:\n"
+        "        print(\n"
+        "            f'CUDA device {CUDA_DEVICE_NAME} is visible, but this torch build does not support {current_arch}. '\n"
+        "            f'Supported arches: {SUPPORTED_CUDA_ARCHES}. Falling back to CPU.\\n'\n"
+        "            f'To use the GPU, run this notebook in an env whose PyTorch supports {current_arch} '\n"
+        "            f'(CUDA 12.8 / torch 2.7+) with a matching mmcv build.'\n"
+        "        )\n"
+        "        return 'cpu'\n"
+        "\n"
+        "    print(f'Using GPU: {CUDA_DEVICE_NAME} ({current_arch}).')\n"
+        "    return 'cuda:0'"
+    )
+
     for cell in nb['cells']:
         if cell['cell_type'] != 'code':
             continue
         src = join(cell)
+        if old_pick in src:
+            src = src.replace(old_pick, new_pick)
+            if 'FORCE_DEVICE = None' not in src:
+                src = src.replace(
+                    'CUDA_DEVICE_NAME = None',
+                    "FORCE_DEVICE = None  # set to 'cuda:0' to force GPU, 'cpu' to force CPU\nCUDA_DEVICE_NAME = None",
+                    1,
+                )
+            cell['source'] = src.splitlines(keepends=True)
+            src = join(cell)
         if "EVAL_SPLIT = 'test'" in src and "METRIC = None" in src:
             src = src.replace("EVAL_SPLIT = 'test'", "EVAL_SPLIT = 'val'")
             src = src.replace("METRIC = None", "METRIC = 'mAP'")

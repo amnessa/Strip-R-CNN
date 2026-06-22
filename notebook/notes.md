@@ -1,4 +1,126 @@
+# Evaluation notebooks (DOTA / FAIR1M / HRSC2016)
 
+There are three workflow notebooks in this folder, one per dataset:
+
+- `dota_strip_rcnn_s_workflow.ipynb`   — checkpoint `weights/strip_rcnn_s_dota.pth`
+- `fair1m_strip_rcnn_s_workflow.ipynb` — checkpoint `weights/strip_rcnn_s_fair1m.pth`
+- `hrsc2016_strip_rcnn_s_workflow.ipynb` — needs an HRSC checkpoint you supply (none ships here)
+
+Each notebook does the same three things: load the detector, render detections
+for chosen classes, and **evaluate the labelled split with mAP**. They are
+generated/maintained by `_build_notebooks.py` (FAIR1M + HRSC are generated, DOTA
+is patched in place to preserve existing outputs).
+
+## Why we evaluate the validation split, not test
+
+The official `test` splits of DOTA and FAIR1M ship **without public labels** —
+they are scored only by the online evaluation servers. So the only honest local
+metric comes from a split whose ground truth we hold:
+
+- **DOTA**: evaluate the `val` split (`EVAL_SPLIT='val'`, `METRIC='mAP'`).
+- **FAIR1M**: the labelled `train` split is exposed as `val` by `fairv1.py`; that
+  is what we score (`EVAL_SPLIT='val'`).
+- **HRSC2016**: the local `test` split *is* labelled (XML annotations), so we
+  score it directly (`EVAL_SPLIT='test'`).
+
+## GPU / sm_120 situation (the original blocker)
+
+The box has an RTX 5070 Ti (Blackwell, **sm_120**). The notebooks are now
+**GPU-first**: `pick_device()` returns `cuda:0` whenever the running torch build
+advertises sm_120, and there is a `FORCE_DEVICE` override at the top of the
+config cell (`'cuda:0'` / `'cpu'` / `None` for auto). On GPU the eval cells
+default to the full split (`MAX_SUBSET_IMAGES = None`); on CPU they bound it
+because Strip R-CNN is a few minutes per image on CPU.
+
+The catch is the environment. Across the conda envs:
+
+| env        | torch          | sm_120 | mmcv/mmdet/mmrotate |
+|------------|----------------|--------|---------------------|
+| openmmlab  | 1.8.0 / cu10.2 | no     | 1.7.2 / 2.28 / 0.3.4 (this codebase) |
+| sdfnet     | 2.8.0 / cu12.8 | **yes**| missing             |
+| segdiff    | 1.9.0 / cu11.1 | no     | missing             |
+
+So `openmmlab` has the right libraries but a torch that cannot drive the GPU,
+and `sdfnet` has a torch that *can* drive the GPU but none of the OpenMMLab
+stack. sm_120 needs CUDA 12.8 / torch 2.7+, and **mmcv 1.x has no prebuilt
+wheels for that** — enabling the GPU means building `mmcv-full` 1.7.2 from
+source against torch 2.8 (cu128) in an sm_120 env, then installing `mmdet`
+2.28.2 and this repo (`pip install -e .`). That build can need source patches
+(torch 2.x C++ API changes) and is not guaranteed first try. The alternative —
+porting StripNet/StripHead to the OpenMMLab 2.x stack (mmcv 2.x + mmdet 3.x +
+mmrotate 1.x), which *does* have cu128 wheels — is a larger code change.
+
+### How to enable the GPU yourself (when ready)
+
+Build the OpenMMLab 1.x stack against the sm_120 torch, in a **clone** so the
+working `sdfnet`/`openmmlab` envs stay intact:
+
+```bash
+# 1. Clone the sm_120 torch env (torch 2.8.0+cu128 already supports sm_120)
+conda create -n strip-gpu --clone sdfnet
+conda activate strip-gpu
+python -c "import torch; print(torch.__version__, torch.cuda.get_arch_list())"
+# expect: 2.8.0+cu128 [... 'sm_120']
+
+# 2. Build mmcv-full 1.7.2 from source against this torch (no cu128 wheel exists).
+#    MMCV_WITH_OPS=1 compiles the CUDA ops; TORCH_CUDA_ARCH_LIST targets Blackwell.
+pip install -r <(echo "ninja psutil")
+MMCV_WITH_OPS=1 TORCH_CUDA_ARCH_LIST="12.0" \
+  pip install "mmcv-full==1.7.2" --no-binary mmcv-full -v
+#    If the compile fails on torch 2.x C++ API changes, that is the known risk;
+#    capture the first error and patch the offending op or pin a newer mmcv 1.x commit.
+
+# 3. Install the detector stack + this repo
+pip install "mmdet==2.28.2"
+cd /home/cagolinux/Strip-R-CNN && pip install -e .
+
+# 4. Sanity check the ops actually run on the GPU
+python -c "import torch, mmcv.ops as o; \
+b=torch.tensor([[0,0,10,10,0]],dtype=torch.float32,device='cuda'); \
+print('nms_rotated ok:', o.nms_rotated(b, torch.tensor([0.9],device='cuda'), 0.1)[0].shape)"
+```
+
+Then launch Jupyter from `strip-gpu` and open any of the three notebooks. With a
+sm_120-capable torch, `pick_device()` prints `Using GPU: ...` and the whole
+pipeline (inference + `dataset.evaluate(metric='mAP')`) runs on the GPU — set
+`MAX_SUBSET_IMAGES = None` to score the full validation split. Nothing in the
+notebooks needs editing; they detect the GPU automatically. If a step in (2)
+fails, the fallback is the OpenMMLab 2.x port noted above.
+
+## DOTA validation data layout (what was fixed)
+
+The DOTA data on disk is the **original** validation set, not MMRotate split
+tiles. `mmrotate/data/DOTA/`:
+
+- `validation/images/` — 458 full scenes (~1000px each)
+- `validation/labelTxt-.../labelTxt-v1.0/labelTxt.zip` — original OBB labels,
+  which include `imagesource:`/`gsd:` header lines that `DOTADataset` cannot parse.
+
+Fix applied: the labels were extracted and cleaned (header lines stripped) into
+`validation/.../labelTxt-v1.0/_extracted` → `val/annfiles_clean`, and a clean
+`val/` layout was created via symlinks so the standard MMRotate paths work:
+
+- `mmrotate/data/DOTA/val/images`   → `../validation/images`
+- `mmrotate/data/DOTA/val/annfiles` → `annfiles_clean` (458 files, headers removed)
+
+Verified: building the val dataset gives 456 usable images, and
+`dataset.evaluate(perfect_preds, metric='mAP')` returns 1.0 — confirmed both in a
+guarded script and inside a real Jupyter kernel (the mAP code uses
+`get_context('spawn').Pool`, which works in-notebook because its target is an
+importable function). For a *faithful* DOTA number you'd normally split val into
+1024px tiles with `tools/data/dota/split` first; direct full-scene eval is a
+reasonable baseline but not identical to the paper protocol.
+
+## HRSC2016 still needs setup
+
+No HRSC detector checkpoint ships here (the repo only has the DOTA and FAIR1M
+detectors plus the ImageNet backbone). HRSC is single-class (`num_classes=1`), so
+a DOTA/FAIR checkpoint will not load. Also, the HRSC2016 download under
+`mmrotate/data/hrsc/archive` is not yet extracted into the expected
+`ImageSets/` + `FullDataSet/{AllImages,Annotations}` layout. The notebook raises
+clear errors until both are provided.
+
+---
 
 This repo is a standard MMRotate project. The actual inference entry points are image_demo.py, huge_image_demo.py, test.py, and the existing notebook MMRotate_Tutorial.ipynb. One important detail: the README has a few inconsistencies, so for real usage you should trust the config files and dataset classes first.
 
